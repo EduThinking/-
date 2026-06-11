@@ -1,0 +1,6 @@
+{
+  "name": "AI 이미지 생성기 스튜디오",
+  "description": "다양한 스타일의 이미지를 생성하고 관리하는 AI 이미지 생성 및 편집 플랫폼입니다. 생성 이력, 즐겨찾기, 공유, 프로필 관리 및 결제 내역 조회를 지원합니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
