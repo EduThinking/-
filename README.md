@@ -15,7 +15,17 @@ npm test           # 예측 엔진·음성 파서 단위 테스트
 npm run build && npm start   # 프로덕션
 ```
 
-`GEMINI_API_KEY`(.env)는 **선택**입니다. 키가 없어도 음성 기록 해석과 AI 코치가 내장 규칙 엔진으로 동작합니다.
+## AI 키 설정 (`GEMINI_API_KEY`, 선택)
+
+| 실행 위치 | 키를 넣는 곳 |
+| --- | --- |
+| 내 컴퓨터 | 프로젝트 루트의 `.env` 파일 (`.env.example` 참고, Git에 올라가지 않음) |
+| Vercel | Project → Settings → Environment Variables → `GEMINI_API_KEY` (Sensitive). `api/` 폴더의 Vercel Functions가 읽어요 |
+
+키는 서버(Functions)에서만 읽고 브라우저로 보내지 않아요. 이름에 `VITE_`를 붙이면 브라우저 번들에 노출되니 붙이지 마세요.
+키를 바꾼 뒤에는 Vercel에서 다시 배포해야 반영돼요.
+
+`GEMINI_API_KEY`는 **선택**입니다. 키가 없어도 음성 기록 해석과 AI 코치가 내장 규칙 엔진으로 동작합니다.
 키를 넣으면 자연어 의도 파악과 코치 답변에 Gemini를 사용합니다(안전 관련 질문은 항상 규칙 기반 답변).
 
 처음 실행 시 **"샘플 데이터로 둘러보기"**를 누르면 생후 7개월 아기의 10일치 기록으로 모든 화면을 확인할 수 있어요.
@@ -36,7 +46,9 @@ npm run build && npm start   # 프로덕션
 ## 구조
 
 ```
-server.ts                 Express: /api/health, /api/voice/parse, /api/coach/chat (+ Vite dev 미들웨어)
+server.ts                 로컬/Node 서버: Express + Vite dev 미들웨어
+api/                      Vercel Functions: /api/health, /api/voice/parse, /api/coach/chat
+src/server/ai.ts          위 두 곳이 함께 쓰는 AI 처리 로직(Gemini 호출 + 규칙 엔진 폴백)
 src/lib/predict.ts        월령 Wake Window 규칙 + 오늘 기록 + 최근 7일 개인 평균 → 다음 수면 범위·하루 일정
 src/lib/events.ts         이벤트 → 낮잠/밤잠 세션, 현재 상태, 상황별 의도 보정("낮잠 중 '일어났어'" → 낮잠 기상)
 src/lib/voiceParser.ts    한국어 의도·시간 파서("10분 전", "2시 반", "아까"는 추측하지 않고 확인 요청)
