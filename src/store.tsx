@@ -18,7 +18,7 @@ const DEFAULT_SETTINGS: Settings = {
   notifyRoutine: true,
   notifyBedtime: true,
   defaultVolume: 0.45,
-  nightMode: false,
+  nightMode: typeof window !== "undefined" && !!window.matchMedia?.("(prefers-color-scheme: dark)").matches,
   favorites: ["pink", "rain"],
 };
 
