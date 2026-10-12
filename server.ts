@@ -2,205 +2,194 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
+import { parseVoice, toOffsetIso } from "./src/lib/voiceParser";
+import { ruleCoachAnswer, SAFETY_NOTE, RED_FLAG, type CoachContext } from "./src/lib/coach";
+import { searchGuides } from "./src/data/guides";
+import type { SleepEventType, VoiceParseResult } from "./src/lib/types";
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const INTENTS: SleepEventType[] = ["WAKE_UP", "NAP_START", "NAP_END", "NIGHT_SLEEP_START", "NIGHT_WAKE", "BACK_TO_SLEEP"];
 
-// Lazily initialize to avoid crashing if GEMINI_API_KEY is not set immediately
-let aiInstance: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
-  if (!aiInstance) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is required. Please add it via Settings > Secrets in the top right.");
-    }
-    aiInstance = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-  }
-  return aiInstance;
+let ai: GoogleGenAI | null = null;
+function getAI(): GoogleGenAI | null {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key || key === "MY_GEMINI_API_KEY") return null;
+  ai ??= new GoogleGenAI({ apiKey: key });
+  return ai;
 }
 
-// A dictionary of style directions to guide the prompt expander
-const STYLE_DESCRIPTIONS: Record<string, string> = {
-  anime: "Vibrant anime illustration, clean lineart, cell-shaded digital painting, colorful aesthetic, high-quality Japanese animation scene.",
-  "3d-render": "Highly detailed 3D digital render, octane render, intricate textures, 3D model, depth of field, vivid cinematic lighting, Pixar-Blender style.",
-  watercolor: "Beautiful loose watercolor painting, flowing color washes, delicate paper texture, organic splatters, elegant manual brushstrokes.",
-  cyberpunk: "Futuristic cyberpunk aesthetic, neon neon-glowing lights, rainy night street reflecting magenta and cyan hues, dark atmosphere, techno-industrial details.",
-  "oil-painting": "Classic textured oil painting, visible canvas texture, rich impasto brushstrokes, masterpiece fine art quality, realistic classical lighting.",
-  "pixel-art": "Nostalgic 16-bit retro pixel art, clean pixel grid detail, limited color palette, video game sprite character landscape.",
-  "pencil-sketch": "Fine hand-drawn pencil/graphite sketch, refined monochrome lines, cross-hatching shade detail, clean white artist paper texture.",
-  cinematic: "Stunning cinematic movie still, dramatic dark/light contrasts (chiaroscuro), anamorphic lens flare, professional film color grading, widescreen depth.",
-  origami: "Intricate origami artwork, folded paper texture, clean geometric creasing, soft shadows, studio lighting, craft concept.",
-  "pop-art": "Retro pop art screenprint, bold ink contours, halftone paper dots, vibrant saturated primary colors, comic-book classic styling."
-};
+/** The client sends its local time + UTC offset so server-side parsing matches the user's clock. */
+function clientNow(body: any): Date {
+  const t = typeof body?.now === "string" ? new Date(body.now) : new Date();
+  return isNaN(t.getTime()) ? new Date() : t;
+}
+
+/** Shift a server Date so that getHours() etc. reflect the client's wall clock. */
+function asClientClock(now: Date, offsetMin: number) {
+  const serverOffset = -now.getTimezoneOffset();
+  return new Date(now.getTime() + (offsetMin - serverOffset) * 60_000);
+}
+
+async function llmParseVoice(text: string, clientClock: Date): Promise<VoiceParseResult | null> {
+  const client = getAI();
+  if (!client) return null;
+  const hhmm = `${String(clientClock.getHours()).padStart(2, "0")}:${String(clientClock.getMinutes()).padStart(2, "0")}`;
+  const res = await client.models.generateContent({
+    model: MODEL,
+    contents: `현재 시각: ${hhmm}\n보호자 발화: "${text}"`,
+    config: {
+      temperature: 0,
+      maxOutputTokens: 200,
+      systemInstruction: [
+        "You classify a Korean caregiver's short utterance about their baby's sleep into exactly one event.",
+        "Intents: WAKE_UP(아침 기상/일어났어), NAP_START(낮잠 들었어), NAP_END(낮잠에서 깼어), NIGHT_SLEEP_START(밤잠 들었어), NIGHT_WAKE(밤중에 깼어), BACK_TO_SLEEP(다시 잠들었어).",
+        "Use intent=null if the utterance is not about sleep.",
+        "Time: if a relative time is said (e.g. '10분 전'), set minutes_ago. If a clock time is said (e.g. '2시 반'), set clock_time as 24h HH:MM choosing the most recent past occurrence.",
+        "If the time is vague (e.g. '아까', '좀 전에'), set ambiguous=true and leave both null — never guess.",
+        "If no time is mentioned, it means 'now': leave both null and ambiguous=false.",
+      ].join("\n"),
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          intent: { type: Type.STRING, enum: INTENTS, nullable: true },
+          minutes_ago: { type: Type.NUMBER, nullable: true },
+          clock_time: { type: Type.STRING, nullable: true },
+          ambiguous: { type: Type.BOOLEAN },
+          confidence: { type: Type.NUMBER },
+        },
+        required: ["intent", "ambiguous", "confidence"],
+      },
+    },
+  });
+  const raw = JSON.parse(res.text || "{}");
+  const intent: SleepEventType | null = INTENTS.includes(raw.intent) ? raw.intent : null;
+  let time: Date | null = clientClock;
+  if (raw.ambiguous) time = null;
+  else if (typeof raw.minutes_ago === "number" && raw.minutes_ago >= 0 && raw.minutes_ago < 24 * 60)
+    time = new Date(clientClock.getTime() - raw.minutes_ago * 60_000);
+  else if (typeof raw.clock_time === "string" && /^\d{1,2}:\d{2}$/.test(raw.clock_time)) {
+    const [h, m] = raw.clock_time.split(":").map(Number);
+    time = new Date(clientClock);
+    time.setHours(h % 24, m % 60, 0, 0);
+    if (time > clientClock) time.setDate(time.getDate() - 1);
+  }
+  const confidence = Math.max(0, Math.min(1, Number(raw.confidence) || 0));
+  return {
+    intent,
+    event_time: time ? toOffsetIso(time) : null,
+    confidence,
+    requires_confirmation: !intent || !time || confidence < 0.8,
+    transcript: text,
+    source: "llm",
+  };
+}
+
+const COACH_SYSTEM = `당신은 한국의 0~24개월 영유아 보호자를 돕는 'AI 수면 코치'입니다.
+원칙:
+1. 제공된 [아기 기록 요약]에서 확인되는 사실과 [검증된 가이드]의 일반 정보를 구분해서 말하세요. "📋 기록에서 확인된 내용"과 "💡 일반적인 정보" 두 단락을 사용하세요.
+2. 진단하지 마세요. "수면장애", "문제가 있다" 같은 표현을 쓰지 말고, 관찰된 변화를 중립적으로 설명하세요.
+3. 확정적 표현을 줄이고("~일 수 있어요", "~해 보세요"), 추천에는 짧은 이유를 붙이세요.
+4. 상관관계를 인과관계처럼 말하지 마세요.
+5. 호흡 이상, 고열, 의식 저하 등 건강 우려가 보이면 수면 조언 대신 119/의료진 상담을 먼저 안내하세요.
+6. 가이드에 없는 새로운 의학적 권고를 만들지 마세요. 안전수면 원칙(바로 눕혀 재우기, 단단하고 평평한 매트리스, 침대에 부드러운 물건 두지 않기)과 충돌하는 조언은 절대 하지 마세요.
+7. 보호자에게 죄책감이나 불안을 주지 말고 따뜻하게, 한국어 존댓말(해요체)로 8문장 이내로 답하세요.
+8. 다음 수면 시간은 [아기 기록 요약]의 prediction 값을 그대로 사용하고 새로 계산하지 마세요.`;
+
+async function llmCoach(question: string, ctx: CoachContext, history: { role: string; text: string }[]) {
+  const client = getAI();
+  if (!client) return null;
+  const guides = searchGuides(question, ctx.baby.ageMonths, 3);
+  const guideText = guides.length
+    ? guides.map((g) => `■ ${g.title} (${g.source})\n${g.body.join("\n")}`).join("\n\n")
+    : "(관련 가이드 없음 — 일반적인 안전수면 원칙만 사용)";
+  const contents = [
+    ...history.slice(-6).map((h) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.text.slice(0, 1500) }] })),
+    {
+      role: "user",
+      parts: [{ text: `[아기 기록 요약]\n${JSON.stringify(ctx, null, 1)}\n\n[검증된 가이드]\n${guideText}\n\n[보호자 질문]\n${question}` }],
+    },
+  ];
+  const res = await client.models.generateContent({
+    model: MODEL,
+    contents,
+    config: { systemInstruction: COACH_SYSTEM, temperature: 0.4, maxOutputTokens: 900 },
+  });
+  const text = res.text?.trim();
+  return text || null;
+}
 
 async function startServer() {
   const app = express();
+  app.use(express.json({ limit: "200kb" }));
 
-  // Increase payload limit since we might handle images
-  app.use(express.json({ limit: "15mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "15mb" }));
-
-  // API endpoint for image generation
-  app.post("/api/generate-image", async (req, res): Promise<any> => {
-    try {
-      const { prompt, style, aspectRatio = "1:1" } = req.body;
-
-      if (!prompt) {
-        return res.status(400).json({ error: "주제를 입력해주세요. (Prompt is required)" });
-      }
-
-      // 1. Initialize Gemini Client
-      let ai: GoogleGenAI;
-      try {
-        ai = getGeminiClient();
-      } catch (err: any) {
-        return res.status(401).json({ 
-          error: "API_KEY_MISSING",
-          message: err.message || "GEMINI_API_KEY가 구동 환경에 존재하지 않습니다."
-        });
-      }
-
-      // 2. Expand prompt using Gemini 3.5 Flash (Translates Korean -> English and details the art style)
-      const selectedStylePrompt = STYLE_DESCRIPTIONS[style] || "";
-      const promptOptimizerInstruction = `
-        You are a highly skilled prompt engineer for AI image generators like Imagen.
-        Your job is to translate the user's prompt (usually in Korean, but could be in English) to English, and expand it with rich artistic descriptions to generate a high-quality masterpiece.
-        
-        Requirements:
-        1. Keep the core subject, action, and mood of the user's prompt intact.
-        2. Combine it beautifully with the requested artistic style: "${style}" (${selectedStylePrompt}).
-        3. Do NOT add unnecessary unrelated elements.
-        4. Output ONLY the finalized expanded English prompt. Do NOT write any introduction, quotes, markdown formatting (no backticks), or explanations. Return just the raw optimized prompt string.
-        
-        Requested style parameters: ${selectedStylePrompt}
-        User's prompt: ${prompt}
-      `.trim();
-
-      let optimizedPrompt = prompt;
-      try {
-        const optimizationRes = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: promptOptimizerInstruction,
-          config: {
-            temperature: 0.7,
-            maxOutputTokens: 200,
-          }
-        });
-        optimizedPrompt = optimizationRes.text?.trim() || prompt;
-      } catch (optError) {
-        console.warn("Prompt optimization failed, calling image generation with raw prompt:", optError);
-        // Fallback to naive translation/format if model call fails
-        optimizedPrompt = `${prompt}, ${selectedStylePrompt}`;
-      }
-
-      console.log(`[AI Image Generator] Prompt: "${prompt}" -> Optimized: "${optimizedPrompt}" (Style: ${style}, Aspect: ${aspectRatio})`);
-
-      // 3. Generate image using Imagen
-      // We will try 'imagen-4.0-generate-001' first.
-      try {
-        const imageRes = await ai.models.generateImages({
-          model: "imagen-4.0-generate-001",
-          prompt: optimizedPrompt,
-          config: {
-            numberOfImages: 1,
-            outputMimeType: "image/jpeg",
-            aspectRatio: aspectRatio as any,
-          }
-        });
-
-        if (imageRes.generatedImages && imageRes.generatedImages.length > 0) {
-          const base64Bytes = imageRes.generatedImages[0].image.imageBytes;
-          const mime = "image/jpeg";
-          const dataUrl = `data:${mime};base64,${base64Bytes}`;
-
-          return res.json({
-            success: true,
-            imageUrl: dataUrl,
-            optimizedPrompt: optimizedPrompt,
-            usedModel: "imagen-4.0-generate-001"
-          });
-        } else {
-          throw new Error("Imagen model returned empty images list.");
-        }
-      } catch (imagenError: any) {
-        console.error("Imagen image generation failed. Trying fallback model:", imagenError.message);
-
-        // Fallback option: imagen-4.0-fast-generate-001
-        try {
-          const fallbackRes = await ai.models.generateImages({
-            model: "imagen-4.0-fast-generate-001",
-            prompt: optimizedPrompt,
-            config: {
-              numberOfImages: 1,
-              outputMimeType: "image/jpeg",
-              aspectRatio: aspectRatio as any,
-            }
-          });
-
-          if (fallbackRes.generatedImages && fallbackRes.generatedImages.length > 0) {
-            const base64Bytes = fallbackRes.generatedImages[0].image.imageBytes;
-            const mime = "image/jpeg";
-            const dataUrl = `data:${mime};base64,${base64Bytes}`;
-
-            return res.json({
-              success: true,
-              imageUrl: dataUrl,
-              optimizedPrompt: optimizedPrompt,
-              usedModel: "imagen-4.0-fast-generate-001"
-            });
-          } else {
-            throw new Error("Fallback Imagen model returned empty images list.");
-          }
-        } catch (fallbackError: any) {
-          console.error("All image generation models failed:", fallbackError.message);
-          return res.status(500).json({
-            error: "GENERATION_FAILED",
-            message: fallbackError.message || imagenError.message || "이미지 생성 도중 오류가 발생했습니다. API 키 상태와 한도를 확인해주십시오.",
-            details: fallbackError.message || imagenError.message
-          });
-        }
-      }
-
-    } catch (err: any) {
-      console.error("Unhandled API error during image generation:", err);
-      return res.status(500).json({
-        error: "SERVER_ERROR",
-        message: "네트워크 통신 중 오류가 발생했습니다.",
-        details: err?.message || String(err)
-      });
-    }
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, ai: !!getAI(), model: getAI() ? MODEL : null });
   });
 
-  // Client-side routing configuration backends
+  // POST /api/voice/parse { text, now, tzOffset }
+  app.post("/api/voice/parse", async (req, res) => {
+    const text = String(req.body?.text ?? "").slice(0, 300).trim();
+    if (!text) return res.status(400).json({ error: "EMPTY_TEXT" });
+    const offset = Number.isFinite(req.body?.tzOffset) ? Number(req.body.tzOffset) : -new Date().getTimezoneOffset();
+    const clock = asClientClock(clientNow(req.body), offset);
+    try {
+      const llm = await llmParseVoice(text, clock);
+      if (llm) return res.json(fixOffset(llm, offset));
+    } catch (err: any) {
+      console.warn("[voice/parse] LLM failed, using rules:", err?.message);
+    }
+    return res.json(fixOffset(parseVoice(text, clock), offset));
+  });
+
+  // POST /api/coach/chat { question, context, history }
+  app.post("/api/coach/chat", async (req, res) => {
+    const question = String(req.body?.question ?? "").slice(0, 1000).trim();
+    const ctx = req.body?.context as CoachContext | undefined;
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    if (!question || !ctx?.baby) return res.status(400).json({ error: "BAD_REQUEST" });
+
+    if (RED_FLAG.test(question)) {
+      // safety answers are deterministic — never delegated to the LLM
+      return res.json({ answer: ruleCoachAnswer(question, ctx), source: "rules" });
+    }
+    try {
+      const answer = await llmCoach(question, ctx, history);
+      if (answer) return res.json({ answer: `${answer}\n\n_${SAFETY_NOTE}_`, source: "llm" });
+    } catch (err: any) {
+      console.warn("[coach/chat] LLM failed, using rules:", err?.message);
+    }
+    return res.json({ answer: ruleCoachAnswer(question, ctx), source: "rules" });
+  });
+
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    // SPA fallback
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    app.get("*", (_req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[ImagineStudio Backend] Server successfully booted and listening on http://0.0.0.0:${PORT}`);
+    console.log(`[Baby Sleep Coach] http://localhost:${PORT}  (AI: ${getAI() ? MODEL : "rules only — set GEMINI_API_KEY to enable"})`);
   });
 }
 
+/** Re-express event_time with the client's UTC offset. */
+function fixOffset(r: VoiceParseResult, offsetMin: number): VoiceParseResult {
+  if (!r.event_time) return r;
+  // r.event_time was built from a client-clock-shifted Date using the server offset
+  const local = r.event_time.slice(0, 19);
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  return { ...r, event_time: `${local}${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}` };
+}
+
 startServer().catch((error) => {
-  console.error("Fatal error starting full-stack server:", error);
+  console.error("Fatal error starting server:", error);
 });
